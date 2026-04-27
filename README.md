@@ -1,2 +1,2 @@
 # NGA_ListenReport
-监听NGA举报通知楼层更新并采用Server酱3发送通知。
+监听NGA版主举报提醒列表的更新并采用Server酱3发送通知。
