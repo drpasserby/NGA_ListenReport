@@ -1,0 +1,13 @@
+# NGA 举报通知监听配置
+# 请把文件名后缀config.yaml.default修改为config.yaml才能正常使用
+
+# NGA 登录 Cookie（从浏览器开发者工具获取）
+# 填写完整的 Cookie 字符串，以分号分隔
+cookie: ""
+
+# Server酱 3 推送配置
+serverchan:
+  sendkey: ""
+
+# 抓取间隔（分钟）
+interval_minutes: 5
