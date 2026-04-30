@@ -57,15 +57,23 @@ def load_config():
 
 
 def load_cache():
+    """返回 (seen_keys: set, pending_reports: list)。兼容旧格式。"""
     if os.path.exists(CACHE_FILE):
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
+            data = json.load(f)
+        if isinstance(data, list):
+            # 旧格式：纯 key 列表
+            return set(data), []
+        return set(data.get("seen_keys", [])), data.get("pending_reports", [])
+    return set(), []
 
 
-def save_cache(cache):
+def save_cache(seen_keys, pending_reports):
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(cache), f, ensure_ascii=False, indent=2)
+        json.dump({
+            "seen_keys": list(seen_keys),
+            "pending_reports": pending_reports
+        }, f, ensure_ascii=False, indent=2)
 
 
 def parse_cookie(cookie_str):
@@ -209,6 +217,26 @@ def push_new_reports(sendkey, new_reports):
     return sc_send(sendkey, title, desp, {"tags": "NGA监测"})
 
 
+def is_dnd_time(dnd_hours):
+    """检查当前时间是否处于免打扰时段。"""
+    if not dnd_hours:
+        return False
+    now = datetime.now().strftime("%H:%M")
+    for period in dnd_hours:
+        parts = period.split("-")
+        if len(parts) != 2:
+            continue
+        start, end = parts[0].strip(), parts[1].strip()
+        if start <= end:
+            if start <= now <= end:
+                return True
+        else:
+            # 跨天时段，如 23:00-07:00
+            if now >= start or now <= end:
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
@@ -217,8 +245,10 @@ def main_loop():
     config = load_config()
     sendkey = config["serverchan"]["sendkey"]
     interval_minutes = config.get("interval_minutes", 10)
+    dnd_hours = config.get("dnd_hours", [])
     cookies = parse_cookie(config["cookie"])
     cache = load_cache()
+    seen_keys, pending_reports = load_cache()
 
     print(f"[启动] 抓取间隔: {interval_minutes} 分钟, 已有缓存: {len(cache)} 条")
     print("=" * 60)
