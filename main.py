@@ -2,7 +2,7 @@
 NGA 举报通知监听脚本
 定时抓取 NGA 举报数据，通过 Server酱 3 推送新增举报到手机。
 
-Version: 1.0.0
+Version: 1.0.1
 
 ## !! 注意事项 !!
 1. 本脚本需要用户提供 NGA 的 Cookie，必须包含登录状态相关字段（如 `ngaPassportUid` 和 `ngaPassportCid`），否则无法获取举报数据。
@@ -247,27 +247,32 @@ def main_loop():
     interval_minutes = config.get("interval_minutes", 10)
     dnd_hours = config.get("dnd_hours", [])
     cookies = parse_cookie(config["cookie"])
-    cache = load_cache()
     seen_keys, pending_reports = load_cache()
 
-    print(f"[启动] 抓取间隔: {interval_minutes} 分钟, 已有缓存: {len(cache)} 条")
+    print(f"[启动] 抓取间隔: {interval_minutes} 分钟, 已缓存: {len(seen_keys)} 条")
+    if dnd_hours:
+        print(f"[启动] 免打扰时段: {dnd_hours}")
+    if pending_reports:
+        print(f"[启动] 有待推送的暂存举报: {len(pending_reports)} 条")
     print("=" * 60)
 
     while True:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        dnd = is_dnd_time(dnd_hours)
         print(f"\n[{now_str}] === 开始抓取 ===")
+        if dnd:
+            print("[免打扰] 当前处于免打扰时段，举报将延迟推送")
 
         try:
             reports = fetch_reports(cookies)
             print(f"[信息] 获取到 {len(reports)} 条举报")
-            print("-" * 60)
 
             new_ones = []
             for r in reports:
                 ck = cache_key(r)
-                if ck not in cache:
+                if ck not in seen_keys:
                     new_ones.append(r)
-                    cache.add(ck)
+                    seen_keys.add(ck)
 
             if new_ones:
                 print(f"[新增] {len(new_ones)} 条 (本次共抓取 {len(reports)} 条):")
@@ -281,17 +286,35 @@ def main_loop():
                     print(f"       理由: {reason}")
                 print("-" * 60)
 
-                print(f"[推送] 正在推送...")
-                try:
-                    resp = push_new_reports(sendkey, new_ones)
-                    print(f"  [推送] 返回: {resp}")
-                except Exception as e:
-                    print(f"  [推送] 失败: {e}")
+                if dnd:
+                    pending_reports.extend(new_ones)
+                    save_cache(seen_keys, pending_reports)
+                    print(f"[免打扰] {len(new_ones)} 条举报已暂存，累计待推送: {len(pending_reports)} 条")
+                else:
+                    to_push = pending_reports + new_ones
+                    pending_reports = []
+                    save_cache(seen_keys, pending_reports)
 
-                save_cache(cache)
-                print(f"[缓存] 已更新, 共 {len(cache)} 条")
+                    print(f"[推送] 正在推送 {len(to_push)} 条举报...")
+                    try:
+                        resp = push_new_reports(sendkey, to_push)
+                        print(f"  [推送] 返回: {resp}")
+                    except Exception as e:
+                        print(f"  [推送] 失败: {e}")
+                    print(f"[缓存] 已更新, 共 {len(seen_keys)} 条")
             else:
-                print(f"[信息] 无新增举报 (本次共抓取 {len(reports)} 条)")
+                # 无新增，但免打扰刚结束，pending 需要推送
+                if pending_reports and not dnd:
+                    print(f"[推送] 免打扰已结束，推送暂存的 {len(pending_reports)} 条举报...")
+                    try:
+                        resp = push_new_reports(sendkey, pending_reports)
+                        print(f"  [推送] 返回: {resp}")
+                    except Exception as e:
+                        print(f"  [推送] 失败: {e}")
+                    pending_reports = []
+                    save_cache(seen_keys, pending_reports)
+                else:
+                    print(f"[信息] 无新增举报 (本次共抓取 {len(reports)} 条)")
 
         except requests.Timeout:
             print("[错误] 请求超时")
