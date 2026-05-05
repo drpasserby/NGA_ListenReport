@@ -246,10 +246,13 @@ def main_loop():
     sendkey = config["serverchan"]["sendkey"]
     interval_minutes = config.get("interval_minutes", 10)
     dnd_hours = config.get("dnd_hours", [])
+    monitor_forums = config.get("monitor_forums", [])
     cookies = parse_cookie(config["cookie"])
     seen_keys, pending_reports = load_cache()
 
     print(f"[启动] 抓取间隔: {interval_minutes} 分钟, 已缓存: {len(seen_keys)} 条")
+    if monitor_forums:
+        print(f"[启动] 限定监测版面: {monitor_forums}")
     if dnd_hours:
         print(f"[启动] 免打扰时段: {dnd_hours}")
     if pending_reports:
@@ -265,7 +268,18 @@ def main_loop():
 
         try:
             reports = fetch_reports(cookies)
-            print(f"[信息] 获取到 {len(reports)} 条举报")
+            total_count = len(reports)
+
+            # 版面过滤
+            if monitor_forums:
+                reports = [r for r in reports if any(
+                    kw in r.get("13", "") for kw in monitor_forums
+                )]
+                skipped = total_count - len(reports)
+                if skipped:
+                    print(f"[过滤] 忽略 {skipped} 条非监测版面的举报")
+
+            print(f"[信息] 获取到 {len(reports)} 条举报 (共抓取 {total_count} 条)")
 
             new_ones = []
             for r in reports:
