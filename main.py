@@ -15,6 +15,7 @@ Version: 1.0.2
 import json
 import os
 import re
+import sys
 import time
 from datetime import datetime
 
@@ -45,6 +46,20 @@ HEADERS = {
     "Origin": "https://bbs.nga.cn",
     "Connection": "keep-alive",
 }
+
+
+_PRINT_LOG = True  # 运行时由 main_loop 根据 config 覆盖
+
+
+def log(*args, **kwargs):
+    """条件打印：仅当 _PRINT_LOG 为 True 时输出到终端。"""
+    if not _PRINT_LOG:
+        return
+    sep = kwargs.pop("sep", " ")
+    end = kwargs.pop("end", "\n")
+    fl = kwargs.pop("file", sys.stdout)
+    fl.write(sep.join(str(a) for a in args) + end)
+    fl.flush()
 
 
 # ---------------------------------------------------------------------------
