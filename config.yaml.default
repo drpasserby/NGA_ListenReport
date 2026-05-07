@@ -20,5 +20,8 @@ dnd_hours:
 monitor_forums:
   - "原神"
 
+# 终端日志开关（默认 true，设为 false 关闭终端输出）
+print_log: true
+
 # 抓取间隔（分钟）
 interval_minutes: 5
