@@ -150,7 +150,7 @@ def fetch_reports(cookies_dict):
         if reports is not None:
             return reports
 
-    print("[警告] 解析策略失败，返回 0 条举报")
+    log("[警告] 解析策略失败，返回 0 条举报")
     return []
 
 
@@ -257,7 +257,9 @@ def is_dnd_time(dnd_hours):
 # ---------------------------------------------------------------------------
 
 def main_loop():
+    global _PRINT_LOG
     config = load_config()
+    _PRINT_LOG = config.get("print_log", True)
     sendkey = config["serverchan"]["sendkey"]
     interval_minutes = config.get("interval_minutes", 10)
     dnd_hours = config.get("dnd_hours", [])
@@ -265,21 +267,21 @@ def main_loop():
     cookies = parse_cookie(config["cookie"])
     seen_keys, pending_reports = load_cache()
 
-    print(f"[启动] 抓取间隔: {interval_minutes} 分钟, 已缓存: {len(seen_keys)} 条")
+    log(f"[启动] 抓取间隔: {interval_minutes} 分钟, 已缓存: {len(seen_keys)} 条")
     if monitor_forums:
-        print(f"[启动] 限定监测版面: {monitor_forums}")
+        log(f"[启动] 限定监测版面: {monitor_forums}")
     if dnd_hours:
-        print(f"[启动] 免打扰时段: {dnd_hours}")
+        log(f"[启动] 免打扰时段: {dnd_hours}")
     if pending_reports:
-        print(f"[启动] 有待推送的暂存举报: {len(pending_reports)} 条")
-    print("=" * 60)
+        log(f"[启动] 有待推送的暂存举报: {len(pending_reports)} 条")
+    log("=" * 60)
 
     while True:
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         dnd = is_dnd_time(dnd_hours)
-        print(f"\n[{now_str}] === 开始抓取 ===")
+        log(f"\n[{now_str}] === 开始抓取 ===")
         if dnd:
-            print("[免打扰] 当前处于免打扰时段，举报将延迟推送")
+            log("[免打扰] 当前处于免打扰时段，举报将延迟推送")
 
         try:
             reports = fetch_reports(cookies)
@@ -292,9 +294,9 @@ def main_loop():
                 )]
                 skipped = total_count - len(reports)
                 if skipped:
-                    print(f"[过滤] 忽略 {skipped} 条非监测版面的举报")
+                    log(f"[过滤] 忽略 {skipped} 条非监测版面的举报")
 
-            print(f"[信息] 获取到 {len(reports)} 条举报 (共抓取 {total_count} 条)")
+            log(f"[信息] 获取到 {len(reports)} 条举报 (共抓取 {total_count} 条)")
 
             new_ones = []
             for r in reports:
@@ -304,54 +306,54 @@ def main_loop():
                     seen_keys.add(ck)
 
             if new_ones:
-                print(f"[新增] {len(new_ones)} 条 (本次共抓取 {len(reports)} 条):")
+                log(f"[新增] {len(new_ones)} 条 (本次共抓取 {len(reports)} 条):")
                 for i, r in enumerate(new_ones, 1):
                     rtype = "主题" if r.get("0") == 13 else "回复"
                     nick = r.get("2", "?")
                     title = r.get("5", "?")
                     reason = r.get("11", "")
                     forum = r.get("13", "")
-                    print(f"  [{i:02d}] [{rtype}] [{forum}] {nick} - {title}")
-                    print(f"       理由: {reason}")
-                print("-" * 60)
+                    log(f"  [{i:02d}] [{rtype}] [{forum}] {nick} - {title}")
+                    log(f"       理由: {reason}")
+                log("-" * 60)
 
                 if dnd:
                     pending_reports.extend(new_ones)
                     save_cache(seen_keys, pending_reports)
-                    print(f"[免打扰] {len(new_ones)} 条举报已暂存，累计待推送: {len(pending_reports)} 条")
+                    log(f"[免打扰] {len(new_ones)} 条举报已暂存，累计待推送: {len(pending_reports)} 条")
                 else:
                     to_push = pending_reports + new_ones
                     pending_reports = []
                     save_cache(seen_keys, pending_reports)
 
-                    print(f"[推送] 正在推送 {len(to_push)} 条举报...")
+                    log(f"[推送] 正在推送 {len(to_push)} 条举报...")
                     try:
                         resp = push_new_reports(sendkey, to_push)
-                        print(f"  [推送] 返回: {resp}")
+                        log(f"  [推送] 返回: {resp}")
                     except Exception as e:
-                        print(f"  [推送] 失败: {e}")
-                    print(f"[缓存] 已更新, 共 {len(seen_keys)} 条")
+                        log(f"  [推送] 失败: {e}")
+                    log(f"[缓存] 已更新, 共 {len(seen_keys)} 条")
             else:
                 # 无新增，但免打扰刚结束，pending 需要推送
                 if pending_reports and not dnd:
-                    print(f"[推送] 免打扰已结束，推送暂存的 {len(pending_reports)} 条举报...")
+                    log(f"[推送] 免打扰已结束，推送暂存的 {len(pending_reports)} 条举报...")
                     try:
                         resp = push_new_reports(sendkey, pending_reports)
-                        print(f"  [推送] 返回: {resp}")
+                        log(f"  [推送] 返回: {resp}")
                     except Exception as e:
-                        print(f"  [推送] 失败: {e}")
+                        log(f"  [推送] 失败: {e}")
                     pending_reports = []
                     save_cache(seen_keys, pending_reports)
                 else:
-                    print(f"[信息] 无新增举报 (本次共抓取 {len(reports)} 条)")
+                    log(f"[信息] 无新增举报 (本次共抓取 {len(reports)} 条)")
 
         except requests.Timeout:
-            print("[错误] 请求超时")
+            log("[错误] 请求超时")
         except Exception as e:
-            print(f"[错误] {e}")
+            log(f"[错误] {e}")
 
-        print(f"\n[等待] {interval_minutes} 分钟后下一轮 ...")
-        print("=" * 60)
+        log(f"\n[等待] {interval_minutes} 分钟后下一轮 ...")
+        log("=" * 60)
         time.sleep(interval_minutes * 60)
 
 
