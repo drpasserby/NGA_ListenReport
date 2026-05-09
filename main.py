@@ -2,7 +2,7 @@
 NGA 举报通知监听脚本
 定时抓取 NGA 举报数据，通过 Server酱 3 推送新增举报到手机。
 
-Version: 1.0.2
+Version: 1.0.3
 
 ## !! 注意事项 !!
 1. 本脚本需要用户提供 NGA 的 Cookie，必须包含登录状态相关字段（如 `ngaPassportUid` 和 `ngaPassportCid`），否则无法获取举报数据。
