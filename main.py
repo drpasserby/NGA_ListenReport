@@ -320,21 +320,28 @@ def main_loop():
                 if dnd:
                     pending_reports.extend(new_ones)
                     save_cache(seen_keys, pending_reports)
-                    log(f"[免打扰] {len(new_ones)} 条举报已暂存，累计待推送: {len(pending_reports)} 条")
+                    log(f"[免打扰] {len(new_ones)} 条举报已暂存，累计 {len(pending_reports)} 条")
                 else:
                     to_push = pending_reports + new_ones
-                    pending_reports = []
-                    save_cache(seen_keys, pending_reports)
-
-                    log(f"[推送] 正在推送 {len(to_push)} 条举报...")
+                    pushed_ok = False
+                    log(f"[推送] 正在推送 {len(to_push)} 条..."
+                        + (f" (含免打扰暂存 {len(pending_reports)} 条)" if pending_reports else ""))
                     try:
                         resp = push_new_reports(sendkey, to_push)
                         log(f"  [推送] 返回: {resp}")
+                        pushed_ok = True
                     except Exception as e:
-                        log(f"  [推送] 失败: {e}")
-                    log(f"[缓存] 已更新, 共 {len(seen_keys)} 条")
+                        log(f"  [推送] 失败: {e}，暂存保留")
+
+                    if pushed_ok:
+                        pending_reports = []
+                    else:
+                        # 推送失败：new_ones 也加入暂存，下次重试
+                        pending_reports.extend(new_ones)
+                    save_cache(seen_keys, pending_reports)
+                    log(f"[缓存] 已更新, 共 {len(seen_keys)} 条记录"
+                        + (f", 待推送暂存 {len(pending_reports)} 条" if pending_reports else ""))
             else:
-                # 无新增，但免打扰刚结束，pending 需要推送
                 if pending_reports and not dnd:
                     log(f"[推送] 免打扰已结束，推送暂存的 {len(pending_reports)} 条举报...")
                     try:
