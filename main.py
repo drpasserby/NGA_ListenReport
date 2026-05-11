@@ -2,7 +2,7 @@
 NGA 举报通知监听脚本
 定时抓取 NGA 举报数据，通过 Server酱 3 推送新增举报到手机。
 
-Version: 1.0.3
+Version: 1.0.4
 
 ## !! 注意事项 !!
 1. 本脚本需要用户提供 NGA 的 Cookie，必须包含登录状态相关字段（如 `ngaPassportUid` 和 `ngaPassportCid`），否则无法获取举报数据。
@@ -344,15 +344,22 @@ def main_loop():
             else:
                 if pending_reports and not dnd:
                     log(f"[推送] 免打扰已结束，推送暂存的 {len(pending_reports)} 条举报...")
+                    pushed_ok = False
                     try:
                         resp = push_new_reports(sendkey, pending_reports)
                         log(f"  [推送] 返回: {resp}")
+                        pushed_ok = True
                     except Exception as e:
-                        log(f"  [推送] 失败: {e}")
-                    pending_reports = []
+                        log(f"  [推送] 失败: {e}，暂存保留")
+
+                    if pushed_ok:
+                        pending_reports = []
                     save_cache(seen_keys, pending_reports)
+                    log(f"[缓存] 已更新, 共 {len(seen_keys)} 条记录"
+                        + (f", 待推送暂存 {len(pending_reports)} 条" if pending_reports else ""))
                 else:
-                    log(f"[信息] 无新增举报 (本次共抓取 {len(reports)} 条)")
+                    log(f"[信息] 无新增举报 (本次共抓取 {len(reports)} 条)"
+                        + (f", 待推送暂存 {len(pending_reports)} 条" if pending_reports else ""))
 
         except requests.Timeout:
             log("[错误] 请求超时")
