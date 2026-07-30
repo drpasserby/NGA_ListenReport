@@ -2,11 +2,11 @@
 NGA 举报通知监听脚本
 定时抓取 NGA 举报数据，通过 Server酱 3 推送举报通知到手机。
 
-功能：
-  1. 新增举报通知 — 检测新举报并推送提醒（可通过 monitor_forums 限定版面）
+支持模式（各模式独立开关与推送间隔，在 config.yaml 的 modes 段配置）：
+  1. 常规举报通知 — 检测新举报并推送提醒
   2. 高频举报检测（模式1）— 同一帖子在时间窗口内被举报次数超阈值时推送告警
 
-Version: 2.0.0
+Version: 2.0.1
 
 ## !! 注意事项 !!
 1. 本脚本需要用户提供 NGA 的 Cookie，必须包含登录状态相关字段（如 `ngaPassportUid` 和 `ngaPassportCid`），否则无法获取举报数据。
@@ -77,13 +77,13 @@ def load_cache():
 
     缓存结构：
     {
-        "seen_keys": [...],          // 新增举报通知：已处理举报的去重键
-        "pending_reports": [...],    // 新增举报通知：免打扰期间暂存的举报
-        "frequent": {                // 高频检测：模式1 数据
-            "mode1_reports": [       //   举报记录滑动窗口
+        "seen_keys": [...],          // 常规通知：已处理举报的去重键
+        "pending_reports": [...],    // 常规通知：免打扰期间暂存的举报
+        "frequent": {                // 高频检测：模式1 滑动窗口与冷却记录
+            "mode1_reports": [
                 {"tid": 123, "ts": 1700000000, "nick": "...", ...}
             ],
-            "mode1_alerted": {       //   各 tid 的最近告警时间（Unix 秒）
+            "mode1_alerted": {
                 "123": 1700000000
             }
         }
@@ -93,7 +93,6 @@ def load_cache():
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            # 旧格式：纯 key 列表
             return set(data), [], {"mode1_reports": [], "mode1_alerted": {}}
         seen = set(data.get("seen_keys", []))
         pending = data.get("pending_reports", [])
@@ -143,7 +142,6 @@ def extract_reports_from_html(html_text):
     if brace == -1:
         return None
 
-    # 括号匹配，定位完整 JSON 对象
     depth = 0
     for i in range(brace, len(html_text)):
         ch = html_text[i]
@@ -157,8 +155,6 @@ def extract_reports_from_html(html_text):
     else:
         return None
 
-    # NGA 部分内部对象使用 JS 风格未加引号的数字键（如 { 9: 123, 0: 1 }），
-    # 先补引号修复为合法 JSON 再解析
     raw_json = re.sub(r'([{,])\s*(\d+)\s*:', r'\1"\2":', raw_json)
 
     try:
@@ -176,7 +172,6 @@ def fetch_reports(cookies_dict):
     resp.encoding = "gbk"
     text = resp.text
 
-    # HTML 中提取内嵌 JSON
     if "window.script_muti_get_var_store" in text:
         reports = extract_reports_from_html(text)
         if reports is not None:
@@ -188,7 +183,6 @@ def fetch_reports(cookies_dict):
 
 def _extract_reports(root):
     """从解析后的 JSON 对象中提取举报数组。"""
-    # 路径: data -> "0" -> "1"
     try:
         reports = root["data"]["0"]["1"]
         if isinstance(reports, list):
@@ -196,7 +190,6 @@ def _extract_reports(root):
     except (KeyError, TypeError):
         pass
 
-    # 备选路径: data -> "1"
     try:
         reports = root["data"]["1"]
         if isinstance(reports, list):
@@ -221,14 +214,13 @@ def is_dnd_time(dnd_hours):
             if start <= now <= end:
                 return True
         else:
-            # 跨天时段，如 23:00-07:00
             if now >= start or now <= end:
                 return True
     return False
 
 
 # ---------------------------------------------------------------------------
-# 新增举报通知
+# 模式1：常规举报通知
 # ---------------------------------------------------------------------------
 
 def cache_key(report):
@@ -284,21 +276,11 @@ def push_new_reports(sendkey, new_reports):
 
 
 # ---------------------------------------------------------------------------
-# 高频举报检测（模式1：同帖高频举报）
+# 模式2：高频举报检测（模式1 — 同帖高频举报）
 # ---------------------------------------------------------------------------
 
 def push_mode1_alert(sendkey, tid, title_text, count, window_minutes, recent_reports):
-    """
-    推送模式1 高频举报告警到 Server酱 3。
-
-    参数:
-        sendkey: Server酱 3 的 SendKey
-        tid: 被高频举报的帖子 ID
-        title_text: 帖子标题
-        count: 窗口内被举报次数
-        window_minutes: 时间窗口（分钟）
-        recent_reports: 该帖子最近的举报记录列表（dict 列表）
-    """
+    """推送模式1 高频举报告警到 Server酱 3。"""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     thread_link = f"[{title_text or '查看帖子'}]({THREAD_URL.format(tid)})"
 
@@ -313,7 +295,6 @@ def push_mode1_alert(sendkey, tid, title_text, count, window_minutes, recent_rep
         "### 近期举报详情：",
     ]
 
-    # 最多展示最近 10 条举报详情
     for r in recent_reports[-10:]:
         ts = r.get("ts", 0)
         time_str = datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
@@ -349,20 +330,18 @@ def check_mode1(reports, frequent_data, mode1_cfg, sendkey, dnd):
     """
     模式1：检测同一帖子在时间窗口内的举报次数是否超过阈值。
 
-    核心逻辑：
-    1. 将本轮新举报的 (tid, 举报时间, 详情) 追加到滑动窗口中
+    1. 将本轮新举报追加到滑动窗口（同时保存详情字段供推送使用）
     2. 清理超出时间窗口的旧记录
     3. 按 tid 分组统计举报次数
     4. 对超过阈值且不在冷却期内的 tid 推送告警
     5. 记录告警时间用于冷却控制
 
     参数:
-        reports: 本轮抓取的所有举报列表（原始格式，可为空列表）
+        reports: 本轮举报列表（原始格式，可为空列表）
         frequent_data: 缓存中的 frequent 子对象
-        mode1_cfg: 模式1配置 dict，包含 window_minutes / threshold / alert_cooldown_minutes
+        mode1_cfg: 模式1配置 {window_minutes, threshold, alert_cooldown_minutes}
         sendkey: Server酱 sendkey
         dnd: 当前是否处于免打扰时段
-
     返回:
         更新后的 frequent_data
     """
@@ -376,7 +355,7 @@ def check_mode1(reports, frequent_data, mode1_cfg, sendkey, dnd):
     mode1_reports = frequent_data.get("mode1_reports", [])
     mode1_alerted = frequent_data.get("mode1_alerted", {})
 
-    # 1. 将本轮新举报追加到滑动窗口（保存关键字段，供推送详情使用）
+    # 1. 追加本轮新举报到滑动窗口
     for r in reports:
         tid = r.get("6", 0)
         ts = r.get("9", 0)
@@ -393,12 +372,12 @@ def check_mode1(reports, frequent_data, mode1_cfg, sendkey, dnd):
                 "rtype": r.get("0", 0),
             })
 
-    # 2. 清理超出时间窗口的旧记录
+    # 2. 清理过期记录
     prev_count = len(mode1_reports)
     mode1_reports = [r for r in mode1_reports if r["ts"] >= cutoff_ts]
-    cleaned = prev_count - len(mode1_reports)
-    if cleaned:
-        log(f"[高频-模式1] 清理 {cleaned} 条过期窗口记录，当前窗口内 {len(mode1_reports)} 条")
+    if prev_count > len(mode1_reports):
+        log(f"[高频-模式1] 清理 {prev_count - len(mode1_reports)} 条过期窗口记录，"
+            f"当前窗口内 {len(mode1_reports)} 条")
 
     # 3. 按 tid 分组统计
     tid_counts = {}
@@ -406,13 +385,13 @@ def check_mode1(reports, frequent_data, mode1_cfg, sendkey, dnd):
         tid = r["tid"]
         tid_counts[tid] = tid_counts.get(tid, 0) + 1
 
-    # 4. 检查是否有超出阈值的 tid
+    # 4. 检查阈值触发
     alerted_count = 0
     for tid, count in tid_counts.items():
         if count < threshold:
             continue
 
-        # 检查冷却时间
+        # 冷却检查
         last_alert_ts = mode1_alerted.get(str(tid), 0)
         if now_ts - last_alert_ts < cooldown_seconds:
             remaining = cooldown_seconds - (now_ts - last_alert_ts)
@@ -420,7 +399,6 @@ def check_mode1(reports, frequent_data, mode1_cfg, sendkey, dnd):
                 f"冷却剩余 {int(remaining / 60)} 分钟，跳过告警")
             continue
 
-        # 获取该 tid 在窗口内的举报详情
         tid_reports = [r for r in mode1_reports if r["tid"] == tid]
         title_text = next((r["title"] for r in tid_reports if r["title"]), "")
 
@@ -429,10 +407,8 @@ def check_mode1(reports, frequent_data, mode1_cfg, sendkey, dnd):
 
         if dnd:
             log(f"[高频-模式1] 当前处于免打扰时段，告警推送已抑制（数据已记录）")
-            # 不记录 alerted 时间戳，免打扰结束后可以再次触发
             continue
 
-        # 推送告警
         try:
             resp = push_mode1_alert(sendkey, tid, title_text, count,
                                     mode1_cfg["window_minutes"], tid_reports)
@@ -445,7 +421,6 @@ def check_mode1(reports, frequent_data, mode1_cfg, sendkey, dnd):
     if alerted_count > 0:
         log(f"[高频-模式1] 本轮共推送 {alerted_count} 条高频告警")
 
-    # 5. 更新并返回 frequent_data
     frequent_data["mode1_reports"] = mode1_reports
     frequent_data["mode1_alerted"] = mode1_alerted
     return frequent_data
@@ -460,53 +435,87 @@ def main_loop():
     config = load_config()
     _PRINT_LOG = config.get("print_log", True)
 
-    # 基本配置
+    # ---- 全局配置 ----
     sendkey = config["serverchan"]["sendkey"]
-    interval_minutes = config.get("interval_minutes", 10)
-    dnd_hours = config.get("dnd_hours", [])
-    monitor_forums = config.get("monitor_forums", [])
+    cookies = parse_cookie(config["cookie"])
 
-    # 高频检测配置
-    frequent_cfg = config.get("frequent", {})
+    # ---- 模式配置 ----
+    modes_cfg = config.get("modes", {})
+
+    # 常规举报通知
+    regular_cfg = modes_cfg.get("regular", {})
+    regular_enabled = regular_cfg.get("enabled", True)
+    regular_interval = regular_cfg.get("interval_minutes", 5)
+    regular_dnd = regular_cfg.get("dnd_hours", [])
+    regular_forums = regular_cfg.get("monitor_forums", [])
+
+    # 高频举报检测
+    frequent_cfg = modes_cfg.get("frequent", {})
     mode1_cfg = frequent_cfg.get("mode1", {})
     mode1_enabled = mode1_cfg.get("enabled", False)
+    mode1_interval = mode1_cfg.get("interval_minutes", 5)
 
-    cookies = parse_cookie(config["cookie"])
+    # ---- 共用抓取间隔（取所有启用模式间隔的最小值）----
+    enabled_intervals = []
+    if regular_enabled:
+        enabled_intervals.append(regular_interval)
+    if mode1_enabled:
+        enabled_intervals.append(mode1_interval)
+    fetch_interval = min(enabled_intervals) if enabled_intervals else 10
+
+    # ---- 各模式上次执行时间戳（0 = 首次总是执行）----
+    last_regular_ts = 0.0
+    last_mode1_ts = 0.0
+
     seen_keys, pending_reports, frequent_data = load_cache()
 
-    log(f"[启动] 抓取间隔: {interval_minutes} 分钟, 已缓存: {len(seen_keys)} 条")
-    if monitor_forums:
-        log(f"[启动] 限定监测版面: {monitor_forums}")
-    if dnd_hours:
-        log(f"[启动] 免打扰时段: {dnd_hours}")
-    if pending_reports:
-        log(f"[启动] 有待推送的暂存举报: {len(pending_reports)} 条")
+    # ---- 启动日志 ----
+    log(f"[启动] NGA 举报监听脚本")
+    if regular_enabled:
+        log(f"[启动] 常规通知: 间隔 {regular_interval} 分钟 | "
+            f"{'限定版面 ' + str(regular_forums) if regular_forums else '全部版面'}"
+            + (f" | 免打扰 {regular_dnd}" if regular_dnd else ""))
+    else:
+        log(f"[启动] 常规通知: 未启用")
     if mode1_enabled:
-        log(f"[启动] 高频检测-模式1（同帖高频举报）:")
-        log(f"        时间窗口: {mode1_cfg.get('window_minutes', 30)} 分钟")
-        log(f"        触发阈值: {mode1_cfg.get('threshold', 3)} 次")
-        log(f"        冷却时间: {mode1_cfg.get('alert_cooldown_minutes', 60)} 分钟")
-        log(f"        缓存中已有 {len(frequent_data.get('mode1_reports', []))} 条窗口记录")
-        log(f"        缓存中已有 {len(frequent_data.get('mode1_alerted', {}))} 条冷却记录")
+        log(f"[启动] 高频检测-模式1: 间隔 {mode1_interval} 分钟 | "
+            f"窗口 {mode1_cfg.get('window_minutes', 30)} 分钟 | "
+            f"阈值 {mode1_cfg.get('threshold', 3)} 次 | "
+            f"冷却 {mode1_cfg.get('alert_cooldown_minutes', 60)} 分钟")
     else:
         log(f"[启动] 高频检测-模式1: 未启用")
+    log(f"[启动] 共用抓取间隔: {fetch_interval} 分钟, 已缓存: {len(seen_keys)} 条")
+    if pending_reports:
+        log(f"[启动] 有待推送的暂存举报: {len(pending_reports)} 条")
     log("=" * 60)
 
     while True:
+        now_ts = time.time()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        dnd = is_dnd_time(dnd_hours)
-        log(f"\n[{now_str}] === 开始抓取 ===")
-        if dnd:
-            log("[免打扰] 当前处于免打扰时段，举报/告警将延迟推送")
+
+        # 判断本轮哪些模式需要执行
+        do_regular = regular_enabled and (now_ts - last_regular_ts >= regular_interval * 60)
+        do_mode1 = mode1_enabled and (now_ts - last_mode1_ts >= mode1_interval * 60)
+
+        if not do_regular and not do_mode1:
+            time.sleep(15)
+            continue
+
+        mode_tags = []
+        if do_regular:
+            mode_tags.append("常规通知")
+        if do_mode1:
+            mode_tags.append("高频检测")
+        log(f"\n[{now_str}] === 开始抓取 ({', '.join(mode_tags)}) ===")
 
         try:
             reports = fetch_reports(cookies)
             total_count = len(reports)
 
-            # 版面过滤
-            if monitor_forums:
+            # 版面过滤（共享：来自 regular 模式的 monitor_forums 配置）
+            if regular_forums:
                 reports = [r for r in reports if any(
-                    kw in r.get("13", "") for kw in monitor_forums
+                    kw in r.get("13", "") for kw in regular_forums
                 )]
                 skipped = total_count - len(reports)
                 if skipped:
@@ -515,91 +524,105 @@ def main_loop():
             log(f"[信息] 获取到 {len(reports)} 条举报 (共抓取 {total_count} 条)")
 
             # ================================================================
-            # 功能1：新增举报通知
+            # 模式：常规举报通知
             # ================================================================
-            new_ones = []
-            for r in reports:
-                ck = cache_key(r)
-                if ck not in seen_keys:
-                    new_ones.append(r)
-                    seen_keys.add(ck)
-
-            if new_ones:
-                log(f"[新增] {len(new_ones)} 条 (本次共抓取 {len(reports)} 条):")
-                for i, r in enumerate(new_ones, 1):
-                    rtype = "主题" if r.get("0") == 13 else "回复"
-                    nick = r.get("2", "?")
-                    title = r.get("5", "?")
-                    reason = r.get("11", "")
-                    forum = r.get("13", "")
-                    log(f"  [{i:02d}] [{rtype}] [{forum}] {nick} - {title}")
-                    log(f"       理由: {reason}")
-                log("-" * 60)
-
+            if do_regular:
+                dnd = is_dnd_time(regular_dnd)
                 if dnd:
-                    pending_reports.extend(new_ones)
-                    log(f"[免打扰] {len(new_ones)} 条举报已暂存，累计 {len(pending_reports)} 条")
-                else:
-                    to_push = pending_reports + new_ones
-                    pushed_ok = False
-                    log(f"[推送] 正在推送 {len(to_push)} 条..."
-                        + (f" (含免打扰暂存 {len(pending_reports)} 条)" if pending_reports else ""))
-                    try:
-                        resp = push_new_reports(sendkey, to_push)
-                        log(f"  [推送] 返回: {resp}")
-                        pushed_ok = True
-                    except Exception as e:
-                        log(f"  [推送] 失败: {e}，暂存保留")
+                    log("[免打扰] 当前处于免打扰时段，常规举报将延迟推送")
 
-                    if pushed_ok:
-                        pending_reports = []
-                    else:
-                        # 推送失败：new_ones 也加入暂存，下次重试
+                new_ones = []
+                for r in reports:
+                    ck = cache_key(r)
+                    if ck not in seen_keys:
+                        new_ones.append(r)
+                        seen_keys.add(ck)
+
+                if new_ones:
+                    log(f"[常规] 新增 {len(new_ones)} 条 (本次共抓取 {len(reports)} 条):")
+                    for i, r in enumerate(new_ones, 1):
+                        rtype = "主题" if r.get("0") == 13 else "回复"
+                        nick = r.get("2", "?")
+                        title = r.get("5", "?")
+                        reason = r.get("11", "")
+                        forum = r.get("13", "")
+                        log(f"  [{i:02d}] [{rtype}] [{forum}] {nick} - {title}")
+                        log(f"       理由: {reason}")
+                    log("-" * 60)
+
+                    if dnd:
                         pending_reports.extend(new_ones)
-            else:
-                if pending_reports and not dnd:
-                    log(f"[推送] 免打扰已结束，推送暂存的 {len(pending_reports)} 条举报...")
-                    pushed_ok = False
-                    try:
-                        resp = push_new_reports(sendkey, pending_reports)
-                        log(f"  [推送] 返回: {resp}")
-                        pushed_ok = True
-                    except Exception as e:
-                        log(f"  [推送] 失败: {e}，暂存保留")
+                        log(f"[免打扰] {len(new_ones)} 条举报已暂存，累计 {len(pending_reports)} 条")
+                    else:
+                        to_push = pending_reports + new_ones
+                        pushed_ok = False
+                        log(f"[推送] 正在推送 {len(to_push)} 条..."
+                            + (f" (含免打扰暂存 {len(pending_reports)} 条)" if pending_reports else ""))
+                        try:
+                            resp = push_new_reports(sendkey, to_push)
+                            log(f"  [推送] 返回: {resp}")
+                            pushed_ok = True
+                        except Exception as e:
+                            log(f"  [推送] 失败: {e}，暂存保留")
 
-                    if pushed_ok:
-                        pending_reports = []
+                        if pushed_ok:
+                            pending_reports = []
+                        else:
+                            pending_reports.extend(new_ones)
                 else:
-                    log(f"[信息] 无新增举报 (本次共抓取 {len(reports)} 条)"
-                        + (f", 待推送暂存 {len(pending_reports)} 条" if pending_reports else ""))
+                    if pending_reports and not dnd:
+                        log(f"[推送] 免打扰已结束，推送暂存的 {len(pending_reports)} 条举报...")
+                        pushed_ok = False
+                        try:
+                            resp = push_new_reports(sendkey, pending_reports)
+                            log(f"  [推送] 返回: {resp}")
+                            pushed_ok = True
+                        except Exception as e:
+                            log(f"  [推送] 失败: {e}，暂存保留")
+
+                        if pushed_ok:
+                            pending_reports = []
+                    else:
+                        log(f"[常规] 无新增举报 (本次共抓取 {len(reports)} 条)"
+                            + (f", 待推送暂存 {len(pending_reports)} 条" if pending_reports else ""))
+
+                last_regular_ts = now_ts
 
             # ================================================================
-            # 功能2：高频举报检测（模式1）
+            # 模式：高频举报检测（模式1）
             # ================================================================
-            if mode1_enabled:
+            if do_mode1:
+                # 高频检测使用常规模式的 DND 设置（可后续独立配置）
+                dnd = is_dnd_time(regular_dnd)
+                if dnd:
+                    log("[免打扰] 当前处于免打扰时段，高频告警将延迟推送")
+
                 frequent_data = check_mode1(
                     reports, frequent_data, mode1_cfg, sendkey, dnd
                 )
+                last_mode1_ts = now_ts
 
             # ================================================================
             # 统一保存缓存
             # ================================================================
             save_cache(seen_keys, pending_reports, frequent_data)
-            cache_info = f"[缓存] 已更新, 共 {len(seen_keys)} 条记录"
+            cache_parts = [f"[缓存] 已更新, 共 {len(seen_keys)} 条记录"]
             if pending_reports:
-                cache_info += f", 待推送暂存 {len(pending_reports)} 条"
+                cache_parts.append(f"待推送暂存 {len(pending_reports)} 条")
             if mode1_enabled:
-                cache_info += f", 窗口内 {len(frequent_data.get('mode1_reports', []))} 条高频记录"
-            log(cache_info)
+                cache_parts.append(f"窗口内 {len(frequent_data.get('mode1_reports', []))} 条高频记录")
+            log(", ".join(cache_parts))
 
         except requests.Timeout:
             log("[错误] 请求超时")
         except Exception as e:
             log(f"[错误] {e}")
 
-        log(f"\n[等待] {interval_minutes} 分钟后下一轮 ...")
+        # 动态计算下次等待时间
+        elapsed = time.time() - now_ts
+        log(f"\n[等待] {fetch_interval} 分钟后下一轮 ...")
         log("=" * 60)
-        time.sleep(interval_minutes * 60)
+        time.sleep(max(0, fetch_interval * 60 - elapsed))
 
 
 if __name__ == "__main__":
