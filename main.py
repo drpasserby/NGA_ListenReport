@@ -3,10 +3,11 @@ NGA 举报通知监听脚本
 定时抓取 NGA 举报数据，通过 Server酱 3 推送举报通知到手机。
 
 支持模式（各模式独立开关与推送间隔，在 config.yaml 的 modes 段配置）：
-  1. 常规举报通知 — 检测新举报并推送提醒
-  2. 高频举报检测（模式1）— 同一帖子在时间窗口内被举报次数超阈值时推送告警
+  0. 常规举报通知      — 检测到新举报立即推送提醒
+  1. 高频举报检测（模式1）— 同一帖子在时间窗口内被举报次数超阈值时推送告警
+  2. 批量举报通知（模式2）— 新举报先累积到缓存，满指定条数后一次性推送
 
-Version: 2.0.1
+Version: 2.1.0
 
 ## !! 注意事项 !!
 1. 本脚本需要用户提供 NGA 的 Cookie，必须包含登录状态相关字段（如 `ngaPassportUid` 和 `ngaPassportCid`），否则无法获取举报数据。
@@ -70,6 +71,16 @@ def log(*args, **kwargs):
 # 缓存
 # ---------------------------------------------------------------------------
 
+def _default_frequent_data():
+    """frequent 子缓存的默认结构（新增模式时在这里补字段，load_cache 会自动兼容旧缓存）。"""
+    return {
+        "mode1_reports": [],      # 模式1：滑动窗口内的举报详情
+        "mode1_alerted": {},      # 模式1：tid -> 上次告警时间戳（冷却控制）
+        "mode2_buffer": [],       # 模式2：已累积、等待凑满阈值的举报
+        "mode2_seen_keys": [],    # 模式2：自身去重键（不依赖常规模式是否启用）
+    }
+
+
 def load_cache():
     """
     加载缓存文件，兼容旧格式。
@@ -79,13 +90,11 @@ def load_cache():
     {
         "seen_keys": [...],          // 常规通知：已处理举报的去重键
         "pending_reports": [...],    // 常规通知：免打扰期间暂存的举报
-        "frequent": {                // 高频检测：模式1 滑动窗口与冷却记录
-            "mode1_reports": [
-                {"tid": 123, "ts": 1700000000, "nick": "...", ...}
-            ],
-            "mode1_alerted": {
-                "123": 1700000000
-            }
+        "frequent": {                // 高频 / 批量检测的缓存
+            "mode1_reports": [...],  // 模式1：滑动窗口内的举报详情
+            "mode1_alerted": {...},  // 模式1：tid -> 上次告警时间戳
+            "mode2_buffer": [...],   // 模式2：待凑满阈值的举报缓冲
+            "mode2_seen_keys": [...] // 模式2：自身去重键
         }
     }
     """
@@ -93,14 +102,17 @@ def load_cache():
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            return set(data), [], {"mode1_reports": [], "mode1_alerted": {}}
+            # 最旧的裸列表格式
+            return set(data), [], _default_frequent_data()
+
         seen = set(data.get("seen_keys", []))
-        pending = data.get("pending_reports", [])
-        freq = data.get("frequent", {})
-        freq.setdefault("mode1_reports", [])
-        freq.setdefault("mode1_alerted", {})
+        pending = data.get("pending_reports", []) or []
+        freq = data.get("frequent") or {}
+        for key, default in _default_frequent_data().items():
+            if freq.get(key) is None:
+                freq[key] = default
         return seen, pending, freq
-    return set(), [], {"mode1_reports": [], "mode1_alerted": {}}
+    return set(), [], _default_frequent_data()
 
 
 def save_cache(seen_keys, pending_reports, frequent_data):
@@ -220,7 +232,7 @@ def is_dnd_time(dnd_hours):
 
 
 # ---------------------------------------------------------------------------
-# 模式1：常规举报通知
+# 模式0：常规举报通知
 # ---------------------------------------------------------------------------
 
 def cache_key(report):
@@ -276,7 +288,7 @@ def push_new_reports(sendkey, new_reports):
 
 
 # ---------------------------------------------------------------------------
-# 模式2：高频举报检测（模式1 — 同帖高频举报）
+# 模式1：高频举报检测（同一帖子在时间窗口内被举报次数超阈值）
 # ---------------------------------------------------------------------------
 
 def push_mode1_alert(sendkey, tid, title_text, count, window_minutes, recent_reports):
@@ -427,6 +439,92 @@ def check_mode1(reports, frequent_data, mode1_cfg, sendkey, dnd):
 
 
 # ---------------------------------------------------------------------------
+# 模式2：批量举报通知（攒够 N 条再推送）
+# ---------------------------------------------------------------------------
+
+def push_mode2_batch(sendkey, reports):
+    """通过 Server酱 3 推送模式2 累积的整批举报（合并为一条消息）。"""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        f"[本次推送时间：{now_str}]",
+        f"已累积 **{len(reports)}** 条举报，汇总如下：",
+    ]
+
+    for r in reports:
+        lines.append(f"- {build_desp(r)}")
+
+    desp = "\n\n".join(lines)
+    title = f"NGA 举报批量通知 ({len(reports)} 条)"
+    return sc_send(sendkey, title, desp, {"tags": "NGA批量监测"})
+
+
+def check_mode2(reports, frequent_data, mode2_cfg, sendkey, dnd):
+    """
+    模式2：把新举报累积到缓存，累积满 threshold 条时一次性推送。
+
+    1. 用模式2 自己的去重键过滤出本轮新举报（不依赖常规模式是否启用）
+    2. 追加到缓存中的待推送缓冲区
+    3. 缓冲区条数 >= threshold 时推送整批并清空缓冲区
+    4. 免打扰期间只累积不推送，待免打扰结束后自动补推
+    5. 推送失败时保留缓冲区，下一轮自动重试
+
+    参数:
+        reports: 本轮举报列表（原始格式，可为空列表）
+        frequent_data: 缓存中的 frequent 子对象
+        mode2_cfg: 模式2配置 {threshold}
+        sendkey: Server酱 sendkey
+        dnd: 当前是否处于免打扰时段
+    返回:
+        更新后的 frequent_data
+    """
+    threshold = max(1, int(mode2_cfg.get("threshold", 10)))
+    buffer = list(frequent_data.get("mode2_buffer") or [])
+    seen = set(frequent_data.get("mode2_seen_keys") or [])
+
+    # 1. 按去重键追加本轮新举报
+    added = 0
+    for r in reports:
+        ck = cache_key(r)
+        if ck in seen:
+            continue
+        seen.add(ck)
+        buffer.append(r)
+        added += 1
+
+    frequent_data["mode2_seen_keys"] = list(seen)
+    frequent_data["mode2_buffer"] = buffer
+
+    if added:
+        log(f"[批量-模式2] 新增 {added} 条，当前累积 {len(buffer)}/{threshold} 条")
+    else:
+        log(f"[批量-模式2] 无新增，当前累积 {len(buffer)}/{threshold} 条")
+
+    # 2. 未满阈值，继续等待
+    if len(buffer) < threshold:
+        return frequent_data
+
+    # 3. 免打扰期间只累积
+    if dnd:
+        log(f"[批量-模式2] 已满 {threshold} 条，但当前处于免打扰时段，推迟推送")
+        return frequent_data
+
+    # 4. 推送整批，成功则清空缓冲区
+    log(f"[批量-模式2] 已达阈值，推送 {len(buffer)} 条举报...")
+    pushed = False
+    try:
+        resp = push_mode2_batch(sendkey, buffer)
+        log(f"  [推送] 返回: {resp}")
+        pushed = True
+    except Exception as e:
+        log(f"  [推送] 失败: {e}，缓冲区保留待下轮重试")
+
+    if pushed:
+        frequent_data["mode2_buffer"] = []
+
+    return frequent_data
+
+
+# ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
 
@@ -455,17 +553,26 @@ def main_loop():
     mode1_enabled = mode1_cfg.get("enabled", False)
     mode1_interval = mode1_cfg.get("interval_minutes", 5)
 
+    # 批量举报通知（模式2）
+    mode2_cfg = frequent_cfg.get("mode2", {})
+    mode2_enabled = mode2_cfg.get("enabled", False)
+    mode2_interval = mode2_cfg.get("interval_minutes", 5)
+    mode2_threshold = max(1, int(mode2_cfg.get("threshold", 10)))
+
     # ---- 共用抓取间隔（取所有启用模式间隔的最小值）----
     enabled_intervals = []
     if regular_enabled:
         enabled_intervals.append(regular_interval)
     if mode1_enabled:
         enabled_intervals.append(mode1_interval)
+    if mode2_enabled:
+        enabled_intervals.append(mode2_interval)
     fetch_interval = min(enabled_intervals) if enabled_intervals else 10
 
     # ---- 各模式上次执行时间戳（0 = 首次总是执行）----
     last_regular_ts = 0.0
     last_mode1_ts = 0.0
+    last_mode2_ts = 0.0
 
     seen_keys, pending_reports, frequent_data = load_cache()
 
@@ -484,6 +591,12 @@ def main_loop():
             f"冷却 {mode1_cfg.get('alert_cooldown_minutes', 60)} 分钟")
     else:
         log(f"[启动] 高频检测-模式1: 未启用")
+    if mode2_enabled:
+        log(f"[启动] 批量通知-模式2: 间隔 {mode2_interval} 分钟 | "
+            f"每满 {mode2_threshold} 条推送一次 | 当前已累积 "
+            f"{len(frequent_data.get('mode2_buffer') or [])} 条")
+    else:
+        log(f"[启动] 批量通知-模式2: 未启用")
     log(f"[启动] 共用抓取间隔: {fetch_interval} 分钟, 已缓存: {len(seen_keys)} 条")
     if pending_reports:
         log(f"[启动] 有待推送的暂存举报: {len(pending_reports)} 条")
@@ -496,8 +609,9 @@ def main_loop():
         # 判断本轮哪些模式需要执行
         do_regular = regular_enabled and (now_ts - last_regular_ts >= regular_interval * 60)
         do_mode1 = mode1_enabled and (now_ts - last_mode1_ts >= mode1_interval * 60)
+        do_mode2 = mode2_enabled and (now_ts - last_mode2_ts >= mode2_interval * 60)
 
-        if not do_regular and not do_mode1:
+        if not do_regular and not do_mode1 and not do_mode2:
             time.sleep(15)
             continue
 
@@ -506,6 +620,8 @@ def main_loop():
             mode_tags.append("常规通知")
         if do_mode1:
             mode_tags.append("高频检测")
+        if do_mode2:
+            mode_tags.append("批量通知")
         log(f"\n[{now_str}] === 开始抓取 ({', '.join(mode_tags)}) ===")
 
         try:
@@ -603,6 +719,20 @@ def main_loop():
                 last_mode1_ts = now_ts
 
             # ================================================================
+            # 模式：批量举报通知（模式2）
+            # ================================================================
+            if do_mode2:
+                # 批量模式同样使用常规模式的 DND 设置
+                dnd = is_dnd_time(regular_dnd)
+                if dnd:
+                    log("[免打扰] 当前处于免打扰时段，批量推送将延迟")
+
+                frequent_data = check_mode2(
+                    reports, frequent_data, mode2_cfg, sendkey, dnd
+                )
+                last_mode2_ts = now_ts
+
+            # ================================================================
             # 统一保存缓存
             # ================================================================
             save_cache(seen_keys, pending_reports, frequent_data)
@@ -611,6 +741,8 @@ def main_loop():
                 cache_parts.append(f"待推送暂存 {len(pending_reports)} 条")
             if mode1_enabled:
                 cache_parts.append(f"窗口内 {len(frequent_data.get('mode1_reports', []))} 条高频记录")
+            if mode2_enabled:
+                cache_parts.append(f"批量缓冲 {len(frequent_data.get('mode2_buffer') or [])}/{mode2_threshold} 条")
             log(", ".join(cache_parts))
 
         except requests.Timeout:
