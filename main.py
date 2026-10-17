@@ -7,7 +7,7 @@ NGA 举报通知监听脚本
   1. 高频举报检测（模式1）— 同一帖子在时间窗口内被举报次数超阈值时推送告警
   2. 批量举报通知（模式2）— 新举报先累积到缓存，满指定条数后一次性推送
 
-Version: 2.1.0
+Version: 2.1.1
 
 ## !! 注意事项 !!
 1. 本脚本需要用户提供 NGA 的 Cookie，必须包含登录状态相关字段（如 `ngaPassportUid` 和 `ngaPassportCid`），否则无法获取举报数据。
@@ -20,6 +20,7 @@ Version: 2.1.0
 import json
 import os
 import re
+import signal
 import sys
 import time
 from datetime import datetime
@@ -116,13 +117,15 @@ def load_cache():
 
 
 def save_cache(seen_keys, pending_reports, frequent_data):
-    """保存缓存文件。"""
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+    """保存缓存文件（先写临时文件再原子替换，避免被停止信号打断时写坏 cache.json）。"""
+    tmp_file = CACHE_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump({
             "seen_keys": list(seen_keys),
             "pending_reports": pending_reports,
             "frequent": frequent_data
         }, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_file, CACHE_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -757,5 +760,20 @@ def main_loop():
         time.sleep(max(0, fetch_interval * 60 - elapsed))
 
 
+def _handle_stop_signal(signum, frame):
+    """把 SIGTERM 转成 KeyboardInterrupt，与 Ctrl+C 走同一条退出路径。"""
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
-    main_loop()
+    # PM2 停止/重启进程时默认发 SIGINT，systemd / docker stop 发 SIGTERM。
+    # 两者统一转成 KeyboardInterrupt，退出时只留一行提示，不再打印 traceback。
+    try:
+        signal.signal(signal.SIGTERM, _handle_stop_signal)
+    except (ValueError, OSError, AttributeError):
+        pass  # 非主线程或平台不支持信号时忽略
+
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        log("\n[退出] 收到停止信号，进程已正常退出")
