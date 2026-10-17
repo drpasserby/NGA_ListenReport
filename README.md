@@ -6,9 +6,11 @@
 
 ## ✨ 项目亮点
 
-- **两套监测模式，各自独立开关与间隔**
+- **三套监测模式，各自独立开关与间隔**
   - `regular`（常规举报通知）：发现新举报即推送。
   - `frequent.mode1`（高频举报告警）：同一帖子在滑动时间窗口内被举报次数达到阈值时告警，用于发现"被集中围攻"的帖子。
+  - `frequent.mode2`（批量举报通知）：新举报先攒着，攒满 `threshold` 条再合并成一条推送，适合只想定期看汇总、不想被频繁打扰的场景。
+- **Linux 一键部署脚本**：`deploy.sh` 自动装好 Node.js / PM2 / Python 虚拟环境与依赖，生成配置模板并设置开机自启，全程提示中文。**（不适用 Windows，Windows 直接双击 bat 即可）**
 - **全量请求 + 增量推送**：每轮抓全量列表，用 `cache.json` 去重，只推送本轮新增；无新增时完全不打扰。
 - **推送合并**：一轮里的多条举报合并成**一条**消息，避免手机被刷屏；正文逐条带用户主页、帖子、回复的直达链接。
 - **免打扰时段**：支持 `23:00-07:00` 这类跨天区间；时段内的新举报先暂存，时段结束后统一补推。
@@ -40,6 +42,16 @@ pip install -r requirements.txt
 ---
 
 ## 🚀 快速开始
+
+### Linux 服务器：一键部署
+
+```bash
+bash deploy.sh --cn
+```
+
+装环境、装 PM2、建配置、设开机自启一条龙，详见下文「部署到 Linux 服务器」。
+
+### 本地 / Windows：手动跑
 
 ```bash
 # 1. 从模板生成配置文件
@@ -92,11 +104,22 @@ python main.py
 | `threshold` | `3` | 窗口内被举报次数 ≥ 此值即告警 |
 | `alert_cooldown_minutes` | `60` | 同一帖子的告警冷却时间（分钟） |
 
+### `modes.frequent.mode2` — 批量举报通知
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `enabled` | `false` | 是否启用 |
+| `interval_minutes` | `5` | 检测间隔（分钟） |
+| `threshold` | `10` | 缓冲区攒满多少条时合并推送一次 |
+
+> ⚠️ 模式2 有自己的去重集合（`mode2_seen_keys`）和自己的缓冲区（`mode2_buffer`），**与常规模式完全独立**。如果 `regular` 和 `mode2` 同时开启，同一批举报会既进常规提醒、又进批量汇总 —— 一般只开其中一个。
+
 ### 几个容易踩的点
 
 1. **抓取间隔是共用的**。程序取所有已启用模式 `interval_minutes` 的**最小值**作为实际抓取周期，各模式再按自己的间隔决定这一轮是否执行。例如常规 5 分钟、高频 10 分钟，则每 5 分钟抓一次，高频模式每隔一轮才处理。
-2. **`monitor_forums` 是共享的**。它挂在 `modes.regular` 下，但版面过滤在两种模式之前统一执行，所以高频检测同样只统计监测版面内的举报。
-3. **高频模式沿用常规模式的免打扰设置**。目前高频告警没有独立的 `dnd_hours`；免打扰期间检测照常进行、数据照常记录，只是不推送。
+2. **`monitor_forums` 是共享的**。它挂在 `modes.regular` 下，但版面过滤在所有模式之前统一执行，所以高频检测和批量通知同样只统计监测版面内的举报。
+3. **所有模式都沿用常规模式的免打扰设置**。高频告警与批量通知都没有独立的 `dnd_hours`；免打扰期间检测照常进行、数据照常记录，只是不推送 —— 攒够阈值的批量通知会一直等到免打扰结束才推。
+4. **批量通知的缓冲区存在 `cache.json` 里**。删掉 `cache.json` 会把攒了一半的举报一起清空（同时也会清空高频滑动窗口）。
 
 ---
 
@@ -129,37 +152,54 @@ python main.py
 
 单条告警最多展示最近 10 条，超出部分以 `... 还有 N 条举报` 收尾。
 
+**批量举报通知** — 标题 `NGA 举报批量通知 (10 条)`：
+
+```markdown
+[本次推送时间：2025-06-01 21:30:12]
+
+已累积 **10** 条举报，汇总如下：
+
+- 【06-01 21:27】【[张三](https://bbs.nga.cn/nuke.php?func=ucp&uid=12345)】举报了【原神>剑斗绮谭】中【[某标题](https://bbs.nga.cn/read.php?tid=46600000)】的主题，理由是【人身攻击】。
+
+- 【06-01 21:28】【[李四](https://bbs.nga.cn/nuke.php?func=ucp&uid=67890)】举报了【原神>剑斗绮谭】中【[某标题](https://bbs.nga.cn/read.php?tid=46600000)】的【[回复](https://bbs.nga.cn/read.php?tid=46600000&pid=46727951&to=1)】，理由是【引战】。
+
+- ...（其余 8 条，格式相同）
+```
+
+Server酱 的 tag 分别是 `NGA监测`（常规）/ `NGA高频监测`（模式1）/ `NGA批量监测`（模式2），可在 APP 里按 tag 分流。
+
 ---
 
 ## 🧠 工作流程
 
 ```
-        ┌──────────────────────────────────────────────┐
-        │  主循环 main_loop()                          │
-        │  每 15s 检查一次：哪个模式到点了？           │
-        └──────────────────┬───────────────────────────┘
-                           │  取最小间隔，抓取一次
-                           ▼
-      POST bbs.nga.cn/nuke.php?__lib=noti&raw=3  (__act=get_all)
-                           │
-                           ▼
-   解析 window.script_muti_get_var_store
-   → 大括号配对取出 JSON 对象 → 修复无引号数字键 → json.loads
-                           │
-                           ▼
-                  版面过滤 monitor_forums
-                           │
-            ┌──────────────┴───────────────┐
-            ▼                              ▼
-  【常规】去重键比对 seen_keys      【高频】追加进滑动窗口
-   新增 → 免打扰？                 按 tid 统计窗口内次数
-     是 → 暂存 pending_reports      超阈值 且 不在冷却期？
-     否 → 合并推送                   ├ 免打扰 → 仅记录，不推送
-  （推送失败 → 暂存下轮重试）        └ 否则 → 推送告警并记录冷却
-            │                              │
-            └──────────────┬───────────────┘
-                           ▼
-                  统一写回 cache.json
+             ┌─────────────────────────────────┐
+             │  主循环 main_loop()             │
+             │  每 15s 检查一次：谁到点了？    │
+             └────────────────┬────────────────┘
+                              │  取最小间隔，抓取一次
+                              ▼
+    POST bbs.nga.cn/nuke.php?__lib=noti&raw=3  (__act=get_all)
+                              │
+                              ▼
+              解析 window.script_muti_get_var_store
+        → 大括号配对取出 JSON → 修复无引号数字键 → json.loads
+                              │
+                              ▼
+                     版面过滤 monitor_forums
+                              │
+        ┌─────────────────────┼───────────────────────┐
+        ▼                     ▼                       ▼
+ 【常规】          【模式1】                【模式2】
+ 比对 seen_keys    按 tid 统计窗口次数      追加进 mode2_buffer
+ 新增 → 免打扰？   超阈值 且 不在冷却？     攒满 threshold 条？
+ 　是 → 暂存       　免打扰 → 仅记录        　免打扰 → 仅累积
+ 　否 → 合并推送   　否则 → 推送 + 记冷却   　否则 → 推送 + 清空
+ （失败 → 暂存）   （失败 → 下轮重试）      （失败 → 保留缓冲）
+        │                     │                       │
+        └─────────────────────┴───────────────────────┘
+                               ▼
+                      统一写回 cache.json
 ```
 
 ### 技术细节
@@ -184,12 +224,15 @@ python main.py
     "pending_reports": [],
     "frequent": {
       "mode1_reports": [{"tid": 46600000, "ts": 1778147234, "nick": "…"}],
-      "mode1_alerted": {"46600000": 1778147234}
+      "mode1_alerted": {"46600000": 1778147234},
+      "mode2_buffer": [],
+      "mode2_seen_keys": []
     }
   }
   ```
 
   代码兼容早期的"裸数组"格式，升级时会自动平滑迁移。
+- **模式2 走的是另一条路**：它有自己的一套去重键（`mode2_seen_keys`），不依赖常规模式是否启用；新举报只往 `mode2_buffer` 里追加，攒满 `threshold` 条才合并推送一次，推送成功后清空缓冲区，失败则保留到下一轮重试。
 - **免打扰判定**：按 `HH:MM` 字符串比较；`start > end` 时视为跨天区间，命中条件为 `now >= start or now <= end`。
 
 ---
@@ -198,10 +241,11 @@ python main.py
 
 ```
 NGA_ListenReport/
-├─ main.py                                 # 全部逻辑：抓取 / 解析 / 去重 / 高频统计 / 推送
+├─ main.py                                 # 全部逻辑：抓取 / 解析 / 去重 / 高频统计 / 批量通知 / 推送
+├─ deploy.sh                               # Linux 一键部署脚本（装 Node / PM2 / 依赖 / 开机自启）
 ├─ config.yaml.default                     # 配置模板（当前 v2 结构）
 ├─ config.yaml                             # 你的私有配置（已在 .gitignore 中忽略）
-├─ cache.json                              # 运行时去重与暂存状态（已在 .gitignore 中忽略）
+├─ cache.json                              # 运行时去重、暂存、滑动窗口与批量缓冲（已在 .gitignore 中忽略）
 ├─ requirements.txt                        # 依赖清单
 ├─ 【Windows直接启动】NGA举报列表监测.bat  # Windows 双击启动
 ├─ TODO.md                                 # 待办 / 已完成
@@ -212,11 +256,59 @@ NGA_ListenReport/
 
 ---
 
-## 🖥️ 云端部署
+## 🖥️ 部署到 Linux 服务器
+
+### 方式一：一键部署脚本（推荐）
+
+把仓库弄到服务器上（`git clone` 或 `scp` 上传），然后：
 
 ```bash
-# PM2（推荐）
-pm2 start main.py --name nga-listen --interpreter python3
+cd NGA_ListenReport
+bash deploy.sh --cn        # 国内服务器建议加 --cn：pip 走清华源、npm 走 npmmirror
+```
+
+脚本会依次完成 6 步，全程中文提示：
+
+1. 安装系统基础依赖（自动识别 `apt` / `dnf` / `yum` / `apk` / `pacman`）
+2. 检查 Node.js（已装且 ≥ v16 就跳过；否则 root 用 NodeSource，非 root 或 `--cn` 用 nvm）
+3. 安装 PM2（非 root 时会依次尝试：可写的全局目录 → `sudo npm -g` → 用户级 `npm -g --prefix ~/.local`）
+4. 创建 Python 虚拟环境 `venv/` 并安装 `requirements.txt`
+5. 从模板生成 `config.yaml`，并交互式引导你填 Cookie 与 SendKey
+6. 用 PM2 启动进程、设置开机自启、打印汇总
+
+常用命令（都在项目目录里执行）：
+
+```bash
+bash deploy.sh -h               # 查看全部用法
+bash deploy.sh status           # 查看进程状态
+bash deploy.sh logs 200         # 看最近 200 行日志
+bash deploy.sh restart          # 重启（改过 config.yaml 后必须重启才生效）
+bash deploy.sh update           # git pull + 更新依赖 + 重启
+bash deploy.sh uninstall        # 移除 PM2 进程（保留代码、config.yaml、cache.json）
+```
+
+其他选项：
+
+| 选项 | 说明 |
+|------|------|
+| `-y` / `--yes` | 全程不询问，全部按默认值执行（适合脚本化部署） |
+| `--cn` | 使用国内镜像源（pip 清华源 / npm npmmirror） |
+| `--no-startup` | 跳过"开机自启"这一步 |
+| `--name <名字>` | 自定义 PM2 进程名，默认 `nga-listen-report` |
+
+也可以用环境变量覆盖：`NGA_APP_NAME`（进程名）、`NGA_REPO_URL`（仓库地址）、`NGA_DIR`（克隆目标目录）。
+
+> ⚠️ **脚本故意不加 `pm2 --watch`**。`main.py` 每一轮都会重写 `cache.json`，`--watch` 会被自己的写操作触发，导致进程无限重启。
+
+> 服务器上还没有仓库时，脚本也支持自我引导：把 `deploy.sh` 单独丢到服务器上直接跑，它会自动 `git clone` 仓库再继续部署。
+
+### 方式二：手动部署
+
+如果不用脚本（比如你已经有自己的环境管理方式），手动起 PM2 / Supervisor 也行：
+
+```bash
+# PM2
+pm2 start main.py --name nga-listen --interpreter python3 --cwd /path/to/NGA_ListenReport
 pm2 save
 pm2 startup
 
@@ -229,9 +321,9 @@ pm2 startup
 # stdout_logfile=/var/log/nga-listen.log
 ```
 
-注意事项：
+### 注意事项
 
-- `main.py` 使用**相对路径**读写 `config.yaml` 与 `cache.json`，所以必须保证工作目录是项目根目录（Supervisor 用 `directory=`，PM2 用 `--cwd`）。
+- `main.py` 使用**相对路径**读写 `config.yaml` 与 `cache.json`，所以必须保证工作目录是项目根目录（Supervisor 用 `directory=`，PM2 用 `--cwd`；`deploy.sh` 已经带上了 `--cwd`）。
 - 程序本身是常驻循环、不退出，交给 PM2 / Supervisor 托管时**不要**配置过短的自动重启间隔，否则会反复重置内存中的计时器；日志交给 `print_log: false` + 进程管理器收集即可。
 - 抓取频率建议 ≥ 5 分钟，别把 NGA 服务器打爆。
 - 🔒 **`config.yaml` 含真实 Cookie / SendKey，不要把它提交进 Git，也不要粘贴到公开 Gist、在线 YAML 编辑器、网盘或任何第三方网站。** 该文件已在 `.gitignore` 中被忽略；传到服务器时请走 `scp` / SFTP 等加密通道单独传送，或者干脆先在服务器上 `cp config.yaml.default config.yaml` 再手动填写真实值。
@@ -241,10 +333,12 @@ pm2 startup
 
 ## ❓ 已知限制与注意事项
 
-- **`seen_keys` 不会自动清理**，会随运行时间线性增长。长期运行后 `cache.json` 会变大；条数过多时可手动删掉 `cache.json`（会重新推送一次当前列表里的所有举报）。
-- **推送成功与否以"是否抛异常"为判据**。`serverchan-sdk` 正常返回错误码时不会抛异常，此时暂存仍会被清空。如果需要严格的送达确认，需要自行检查 `sc_send` 的返回内容。
-- **高频统计依赖缓存连续性**。删除 `cache.json` 会同时清空滑动窗口，重启后需要重新积累窗口内的举报才能触发告警。
+- **`seen_keys` / `mode2_seen_keys` 不会自动清理**，会随运行时间线性增长。长期运行后 `cache.json` 会变大；条数过多时可手动删掉 `cache.json`（会重新推送一次当前列表里的所有举报）。
+- **推送成功与否以"是否抛异常"为判据**。`serverchan-sdk` 正常返回错误码时不会抛异常，此时暂存/缓冲区仍会被清空。如果需要严格的送达确认，需要自行检查 `sc_send` 的返回内容。
+- **模式1 和模式2 都依赖缓存连续性**。删除 `cache.json` 会同时清空高频滑动窗口与批量缓冲区，重启后需要重新积累。
+- **批量通知在免打扰期间不会送达**。攒够条数但正好处于免打扰时段时，会一直等到时段结束才推送。
 - **Cookie 会过期**，失效后表现为日志里"解析策略失败，返回 0 条举报"。重新登录抓一次 Cookie 即可。
+- **`deploy.sh` 面向 Linux 服务器（bash）**，在 Ubuntu 上做过完整的安装/重启/更新/卸载端到端验证。Windows 请直接双击 bat 或手动 `python main.py`；macOS 未验证。
 - 本项目仅供**个人自用**，请勿大规模分发或商用。
 
 ---
